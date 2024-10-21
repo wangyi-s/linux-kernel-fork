@@ -2937,6 +2937,7 @@ static bool bio_unaligned(const struct bio *bio, struct request_queue *q)
  * It will not queue the request if there is an error with the bio, or at the
  * request creation.
  */
+//提交bio
 void blk_mq_submit_bio(struct bio *bio)
 {
 	struct request_queue *q = bdev_get_queue(bio->bi_bdev);
