@@ -148,17 +148,29 @@ xfs_qm_dqpurge(
 		 * We don't care about getting disk errors here. We need
 		 * to purge this dquot anyway, so we go ahead regardless.
 		 */
-		error = xfs_qm_dqflush(dqp, &bp);
-		if (!error) {
-			error = xfs_bwrite(bp);
-			xfs_buf_relse(bp);
-		} else if (error == -EAGAIN) {
+		error = xfs_dquot_use_attached_buf(dqp, &bp);
+		if (error == -EAGAIN) {
+			xfs_dqfunlock(dqp);
 			dqp->q_flags &= ~XFS_DQFLAG_FREEING;
 			goto out_unlock;
 		}
+		if (!bp)
+			goto out_funlock;
+
+		/*
+		 * dqflush completes dqflock on error, and the bwrite ioend
+		 * does it on success.
+		 */
+		error = xfs_qm_dqflush(dqp, bp);
+		if (!error) {
+			error = xfs_bwrite(bp);
+			xfs_buf_relse(bp);
+		}
 		xfs_dqflock(dqp);
 	}
+	xfs_dquot_detach_buf(dqp);
 
+out_funlock:
 	ASSERT(atomic_read(&dqp->q_pincount) == 0);
 	ASSERT(xlog_is_shutdown(dqp->q_logitem.qli_item.li_log) ||
 		!test_bit(XFS_LI_IN_AIL, &dqp->q_logitem.qli_item.li_flags));
@@ -240,6 +252,10 @@ xfs_qm_destroy_quotainos(
 	if (qi->qi_pquotaip) {
 		xfs_irele(qi->qi_pquotaip);
 		qi->qi_pquotaip = NULL;
+	}
+	if (qi->qi_dirip) {
+		xfs_irele(qi->qi_dirip);
+		qi->qi_dirip = NULL;
 	}
 }
 
@@ -441,9 +457,8 @@ static enum lru_status
 xfs_qm_dquot_isolate(
 	struct list_head	*item,
 	struct list_lru_one	*lru,
-	spinlock_t		*lru_lock,
 	void			*arg)
-		__releases(lru_lock) __acquires(lru_lock)
+		__releases(&lru->lock) __acquires(&lru->lock)
 {
 	struct xfs_dquot	*dqp = container_of(item,
 						struct xfs_dquot, q_lru);
@@ -489,9 +504,19 @@ xfs_qm_dquot_isolate(
 		trace_xfs_dqreclaim_dirty(dqp);
 
 		/* we have to drop the LRU lock to flush the dquot */
-		spin_unlock(lru_lock);
+		spin_unlock(&lru->lock);
 
-		error = xfs_qm_dqflush(dqp, &bp);
+		error = xfs_dquot_use_attached_buf(dqp, &bp);
+		if (!bp || error == -EAGAIN) {
+			xfs_dqfunlock(dqp);
+			goto out_unlock_dirty;
+		}
+
+		/*
+		 * dqflush completes dqflock on error, and the delwri ioend
+		 * does it on success.
+		 */
+		error = xfs_qm_dqflush(dqp, bp);
 		if (error)
 			goto out_unlock_dirty;
 
@@ -499,6 +524,8 @@ xfs_qm_dquot_isolate(
 		xfs_buf_relse(bp);
 		goto out_unlock_dirty;
 	}
+
+	xfs_dquot_detach_buf(dqp);
 	xfs_dqfunlock(dqp);
 
 	/*
@@ -525,7 +552,6 @@ out_unlock_dirty:
 	trace_xfs_dqreclaim_busy(dqp);
 	XFS_STATS_INC(dqp->q_mount, xs_qm_dqreclaim_misses);
 	xfs_dqunlock(dqp);
-	spin_lock(lru_lock);
 	return LRU_RETRY;
 }
 
@@ -648,8 +674,7 @@ xfs_qm_init_timelimits(
 static int
 xfs_qm_load_metadir_qinos(
 	struct xfs_mount	*mp,
-	struct xfs_quotainfo	*qi,
-	struct xfs_inode	**dpp)
+	struct xfs_quotainfo	*qi)
 {
 	struct xfs_trans	*tp;
 	int			error;
@@ -658,7 +683,7 @@ xfs_qm_load_metadir_qinos(
 	if (error)
 		return error;
 
-	error = xfs_dqinode_load_parent(tp, dpp);
+	error = xfs_dqinode_load_parent(tp, &qi->qi_dirip);
 	if (error == -ENOENT) {
 		/* no quota dir directory, but we'll create one later */
 		error = 0;
@@ -668,21 +693,21 @@ xfs_qm_load_metadir_qinos(
 		goto out_trans;
 
 	if (XFS_IS_UQUOTA_ON(mp)) {
-		error = xfs_dqinode_load(tp, *dpp, XFS_DQTYPE_USER,
+		error = xfs_dqinode_load(tp, qi->qi_dirip, XFS_DQTYPE_USER,
 				&qi->qi_uquotaip);
 		if (error && error != -ENOENT)
 			goto out_trans;
 	}
 
 	if (XFS_IS_GQUOTA_ON(mp)) {
-		error = xfs_dqinode_load(tp, *dpp, XFS_DQTYPE_GROUP,
+		error = xfs_dqinode_load(tp, qi->qi_dirip, XFS_DQTYPE_GROUP,
 				&qi->qi_gquotaip);
 		if (error && error != -ENOENT)
 			goto out_trans;
 	}
 
 	if (XFS_IS_PQUOTA_ON(mp)) {
-		error = xfs_dqinode_load(tp, *dpp, XFS_DQTYPE_PROJ,
+		error = xfs_dqinode_load(tp, qi->qi_dirip, XFS_DQTYPE_PROJ,
 				&qi->qi_pquotaip);
 		if (error && error != -ENOENT)
 			goto out_trans;
@@ -698,34 +723,40 @@ out_trans:
 STATIC int
 xfs_qm_create_metadir_qinos(
 	struct xfs_mount	*mp,
-	struct xfs_quotainfo	*qi,
-	struct xfs_inode	**dpp)
+	struct xfs_quotainfo	*qi)
 {
 	int			error;
 
-	if (!*dpp) {
-		error = xfs_dqinode_mkdir_parent(mp, dpp);
+	if (!qi->qi_dirip) {
+		error = xfs_dqinode_mkdir_parent(mp, &qi->qi_dirip);
 		if (error && error != -EEXIST)
 			return error;
+		/*
+		 * If the /quotas dirent points to an inode that isn't
+		 * loadable, qi_dirip will be NULL but mkdir_parent will return
+		 * -EEXIST.  In this case the metadir is corrupt, so bail out.
+		 */
+		if (XFS_IS_CORRUPT(mp, qi->qi_dirip == NULL))
+			return -EFSCORRUPTED;
 	}
 
 	if (XFS_IS_UQUOTA_ON(mp) && !qi->qi_uquotaip) {
-		error = xfs_dqinode_metadir_create(*dpp, XFS_DQTYPE_USER,
-				&qi->qi_uquotaip);
+		error = xfs_dqinode_metadir_create(qi->qi_dirip,
+				XFS_DQTYPE_USER, &qi->qi_uquotaip);
 		if (error)
 			return error;
 	}
 
 	if (XFS_IS_GQUOTA_ON(mp) && !qi->qi_gquotaip) {
-		error = xfs_dqinode_metadir_create(*dpp, XFS_DQTYPE_GROUP,
-				&qi->qi_gquotaip);
+		error = xfs_dqinode_metadir_create(qi->qi_dirip,
+				XFS_DQTYPE_GROUP, &qi->qi_gquotaip);
 		if (error)
 			return error;
 	}
 
 	if (XFS_IS_PQUOTA_ON(mp) && !qi->qi_pquotaip) {
-		error = xfs_dqinode_metadir_create(*dpp, XFS_DQTYPE_PROJ,
-				&qi->qi_pquotaip);
+		error = xfs_dqinode_metadir_create(qi->qi_dirip,
+				XFS_DQTYPE_PROJ, &qi->qi_pquotaip);
 		if (error)
 			return error;
 	}
@@ -770,7 +801,6 @@ xfs_qm_init_metadir_qinos(
 	struct xfs_mount	*mp)
 {
 	struct xfs_quotainfo	*qi = mp->m_quotainfo;
-	struct xfs_inode	*dp = NULL;
 	int			error;
 
 	if (!xfs_has_quota(mp)) {
@@ -779,20 +809,22 @@ xfs_qm_init_metadir_qinos(
 			return error;
 	}
 
-	error = xfs_qm_load_metadir_qinos(mp, qi, &dp);
+	error = xfs_qm_load_metadir_qinos(mp, qi);
 	if (error)
 		goto out_err;
 
-	error = xfs_qm_create_metadir_qinos(mp, qi, &dp);
+	error = xfs_qm_create_metadir_qinos(mp, qi);
 	if (error)
 		goto out_err;
 
-	xfs_irele(dp);
+	/* The only user of the quota dir inode is online fsck */
+#if !IS_ENABLED(CONFIG_XFS_ONLINE_SCRUB)
+	xfs_irele(qi->qi_dirip);
+	qi->qi_dirip = NULL;
+#endif
 	return 0;
 out_err:
 	xfs_qm_destroy_quotainos(mp->m_quotainfo);
-	if (dp)
-		xfs_irele(dp);
 	return error;
 }
 
@@ -1306,6 +1338,10 @@ xfs_qm_quotacheck_dqadjust(
 		return error;
 	}
 
+	error = xfs_dquot_attach_buf(NULL, dqp);
+	if (error)
+		return error;
+
 	trace_xfs_dqadjust(dqp);
 
 	/*
@@ -1488,11 +1524,17 @@ xfs_qm_flush_one(
 		goto out_unlock;
 	}
 
-	error = xfs_qm_dqflush(dqp, &bp);
+	error = xfs_dquot_use_attached_buf(dqp, &bp);
 	if (error)
 		goto out_unlock;
+	if (!bp) {
+		error = -EFSCORRUPTED;
+		goto out_unlock;
+	}
 
-	xfs_buf_delwri_queue(bp, buffer_list);
+	error = xfs_qm_dqflush(dqp, bp);
+	if (!error)
+		xfs_buf_delwri_queue(bp, buffer_list);
 	xfs_buf_relse(bp);
 out_unlock:
 	xfs_dqunlock(dqp);
