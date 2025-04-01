@@ -597,11 +597,12 @@ dm_dp_add_mst_connector(struct drm_dp_mst_topology_mgr *mgr,
 	amdgpu_dm_set_mst_status(&aconnector->mst_status,
 			MST_PROBE, true);
 
-	if (drm_connector_init(
+	if (drm_connector_dynamic_init(
 		dev,
 		connector,
 		&dm_dp_mst_connector_funcs,
-		DRM_MODE_CONNECTOR_DisplayPort)) {
+		DRM_MODE_CONNECTOR_DisplayPort,
+		NULL)) {
 		kfree(aconnector);
 		return NULL;
 	}
@@ -1624,7 +1625,6 @@ int pre_validate_dsc(struct drm_atomic_state *state,
 
 		if (ind >= 0) {
 			struct drm_connector *connector;
-			struct amdgpu_dm_connector *aconnector;
 			struct drm_connector_state *drm_new_conn_state;
 			struct dm_connector_state *dm_new_conn_state;
 			struct dm_crtc_state *dm_old_crtc_state;
@@ -1632,15 +1632,17 @@ int pre_validate_dsc(struct drm_atomic_state *state,
 			connector =
 				amdgpu_dm_find_first_crtc_matching_connector(state,
 									     state->crtcs[ind].ptr);
-			aconnector = to_amdgpu_dm_connector(connector);
+			if (!connector)
+				continue;
+
 			drm_new_conn_state =
 				drm_atomic_get_new_connector_state(state,
-								   &aconnector->base);
+								   connector);
 			dm_new_conn_state = to_dm_connector_state(drm_new_conn_state);
 			dm_old_crtc_state = to_dm_crtc_state(state->crtcs[ind].old_state);
 
 			local_dc_state->streams[i] =
-				create_validate_stream_for_sink(aconnector,
+				create_validate_stream_for_sink(connector,
 								&state->crtcs[ind].new_state->mode,
 								dm_new_conn_state,
 								dm_old_crtc_state->stream);
@@ -1695,16 +1697,16 @@ clean_exit:
 	return ret;
 }
 
-static unsigned int kbps_from_pbn(unsigned int pbn)
+static uint32_t kbps_from_pbn(unsigned int pbn)
 {
-	unsigned int kbps = pbn;
+	uint64_t kbps = (uint64_t)pbn;
 
 	kbps *= (1000000 / PEAK_FACTOR_X1000);
 	kbps *= 8;
 	kbps *= 54;
 	kbps /= 64;
 
-	return kbps;
+	return (uint32_t)kbps;
 }
 
 static bool is_dsc_common_config_possible(struct dc_stream_state *stream,
